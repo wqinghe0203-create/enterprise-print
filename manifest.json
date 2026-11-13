@@ -1,0 +1,12 @@
+{
+  "manifest_version": "1.0",
+  "name": "enterprise-print",
+  "display_name": "enterprise-print",
+  "version": "1.0.1",
+  "description": "通过 WorkBuddy 打印聊天正文和附件，查询企业 Print Hub 设备、队列、任务和打印记录。",
+  "entrypoint": "scripts/print_hub.py",
+  "dependencies": {
+    "python": ">=3.9",
+    "pip_packages": []
+  }
+}
