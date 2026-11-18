@@ -15,7 +15,8 @@ import re
 import ssl
 import sys
 import tempfile
-from urllib.parse import urlencode
+import time
+from urllib.parse import quote, urlencode
 import uuid
 import webbrowser
 
@@ -100,14 +101,58 @@ def connect(timeout):
         raise
 
 
-def api(path, *, params=None, method="GET", body=None, content_type=None, admin=False):
-    headers = auth_headers(admin)
+def personal_profile():
+    if sys.platform == "win32":
+        root = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        configured = Path(os.getenv("XDG_DATA_HOME") or ".")
+        root = configured if configured.is_absolute() else Path.home() / ".local" / "share"
+    return root / "enterprise-printer-hub" / "personal"
+
+
+def personal_session():
+    message = "本机 Print Hub 未就绪。请启动个人打印后台后重试。"
+    try:
+        info = json.loads((personal_profile() / "session.json").read_text(encoding="utf-8"))
+        port, token = info["port"], info["token"]
+        if type(port) is not int or not 1 <= port <= 65535 or not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            raise ValueError("invalid session")
+        ready = api("/api/local-ready", scope="personal", session=(port, token))
+        if ready.get("scope") != "personal":
+            raise ValueError("wrong service")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, HubError) as exc:
+        raise HubError(message, code="personal_service_unavailable") from exc
+    return port, token
+
+
+def api(path, *, params=None, method="GET", body=None, content_type=None, admin=False, scope="shared", session=None):
+    if scope == "personal":
+        port, token = session or personal_session()
+        headers = {"Accept": "application/json", "X-Print-Hub-Token": token}
+    else:
+        printer_route = path in ("/api/printer-probes", "/api/printers") or path.startswith(
+            ("/api/printer-probes/", "/api/printers/")
+        )
+        headers = auth_headers(admin or printer_route)
+        if printer_route:
+            headers["Origin"] = BASE_URL
     if content_type:
         headers["Content-Type"] = content_type
     if params:
         path += "?" + urlencode({key: value for key, value in params.items() if value is not None})
     try:
-        connection = connect(timeout=60 if body is not None else 20)
+        timeout = 2 if path == "/api/local-ready" else 60 if body is not None else 20
+        if scope == "personal":
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+            try:
+                connection.connect()
+            except OSError:
+                connection.close()
+                raise
+        else:
+            connection = connect(timeout=timeout)
     except ssl.SSLCertVerificationError as exc:
         raise HubError("无法验证后台证书，请配置公司 CA 或管理员提供的证书指纹。", code="tls_untrusted") from exc
     except (OSError, http.client.HTTPException) as exc:
@@ -129,6 +174,8 @@ def api(path, *, params=None, method="GET", body=None, content_type=None, admin=
         result = None
     error = result.get("error") if isinstance(result, dict) else None
     if response.status == 401:
+        if scope == "personal":
+            raise HubError("本机后台会话已失效，请重新打开本机打印后台。", code="personal_service_unavailable")
         challenge = response.getheader("WWW-Authenticate", "")
         message = "请在 WorkBuddy 执行环境配置后台登录账号和密码。" if "basic" in challenge.lower() else "请检查 Print Hub API 访问令牌。"
         raise HubError(message, code="unauthorized")
@@ -248,7 +295,8 @@ def setup_options(printers):
     for index, device in enumerate(printers):
         letter = SETUP_LETTERS[index] if index < len(SETUP_LETTERS) else f"E{index + 1}"
         label = device.get("name") or device["id"]
-        notes = [device["location"]] if device.get("location") else []
+        location = (device.get("location") or "").strip() or "未设置位置"
+        notes = []
         if device.get("online") is False:
             notes.append("离线")
         reasons = device.get("reasons") or []
@@ -260,10 +308,10 @@ def setup_options(printers):
             notes.append("墨粉偏低")
         devices.append({"choice": letter, "printer_id": device["id"]})
         device_options.append({
-            "label": f"{letter} · {label}",
+            "label": f"{letter} · {label}（{location}）",
             "description": "，".join(notes) or "设为个人常用打印机",
         })
-    add = {"label": "C · 提交后打开后台添加打印机", "description": "提交这张卡后打开「打印设备」，添加完再选择新设备"}
+    add = {"label": "C · 在对话中添加共享打印机", "description": "提供打印机 IP，添加到中心平台后返回此处选择"}
     if len(device_options) <= 3:
         options = [*device_options, add]
     else:
@@ -288,7 +336,6 @@ def setup_options(printers):
         **setup_questions(questions),
         "printers": devices,
         "device_options": device_options,
-        "add_printer_url": PRINTER_DEVICES_URL,
     }
 
 
@@ -468,6 +515,123 @@ def submit(args):
         raise
 
 
+def printer_probe(probe_id, scope):
+    if not re.fullmatch(r"[a-f0-9]{32}", probe_id):
+        raise HubError("检测标识无效，请重新检测设备。", code="invalid_probe_id")
+    deadline = time.monotonic() + 15
+    while True:
+        result = api("/api/printer-probes/" + probe_id, scope=scope)
+        if result.get("status") != "pending" or time.monotonic() >= deadline:
+            return result
+        time.sleep(0.5)
+
+
+def register_printer(args, scope):
+    action = args.printer_action
+    if action == "check":
+        return {"probe": printer_probe(args.probe_id, scope)}
+    if action == "detect":
+        body = {"ip": args.ip, "ipp_port": args.ipp_port, "ipp_path": args.ipp_path}
+        result = api("/api/printer-probes", method="POST", body=json.dumps(body).encode("utf-8"),
+                     content_type="application/json", scope=scope)
+        return {"probe": printer_probe(result["probe_id"], scope)}
+    probe = printer_probe(args.probe_id, scope)
+    if not probe.get("can_save"):
+        raise HubError(probe.get("error") or "请等待检测成功后再保存。", code="probe_not_ready")
+    body = json.dumps({
+        "probe_id": args.probe_id,
+        "name": args.name if args.name is not None else probe["name"],
+        "location": args.location,
+    }).encode("utf-8")
+    # The center deduplicates retries by probe_id.
+    for attempt in range(2):
+        try:
+            saved = api("/api/printers", method="POST", body=body,
+                        content_type="application/json", scope=scope)
+            if scope == "personal":
+                return saved
+            printer = saved.get("printer") if isinstance(saved, dict) else None
+            if not isinstance(printer, dict) or not isinstance(printer.get("id"), str) or not printer["id"]:
+                raise HubError("后台未返回已保存的打印机。", code="invalid_response", uncertain=True)
+            return {**saved, "scope": scope, "url": PRINTER_DEVICES_URL}
+        except HubError as exc:
+            if scope == "personal" or (attempt == 0 and not exc.uncertain):
+                raise
+            if attempt == 1:
+                raise HubError("共享打印机保存结果待核实，请先查看中心设备列表。",
+                               code="registration_unconfirmed", uncertain=True) from exc
+
+
+def shared_printer_config(printer_path, target_id):
+    response = api(printer_path)
+    printer = response.get("printer") if isinstance(response, dict) else None
+    if not isinstance(printer, dict) or printer.get("id") != target_id:
+        raise HubError("后台未返回指定设备的配置。", code="invalid_response")
+    return printer
+
+
+def edit_shared_printer(args):
+    action = args.printer_action
+    if action == "edit-detect":
+        body = {"printer_id": args.printer_id}
+        for field in ("ipp_port", "ipp_path"):
+            value = getattr(args, field)
+            if value is not None:
+                body[field] = value
+        if len(body) == 1:
+            raise HubError("请指定要修改的 IPP 端口或路径。", code="missing_changes")
+        result = api("/api/printer-probes", method="POST", body=json.dumps(body).encode("utf-8"),
+                     content_type="application/json")
+        return {"probe": printer_probe(result["probe_id"], "shared")}
+    if action == "show":
+        keyword = args.printer.strip()
+        if not keyword:
+            raise HubError("请指定要查看的打印机。", code="printer_required")
+        try:
+            printer = shared_printer_config("/api/printers/" + quote(keyword, safe=""), keyword)
+        except HubError as exc:
+            if exc.code != "http_404":
+                raise
+            target_id = printer_id(keyword)
+            printer = shared_printer_config("/api/printers/" + quote(target_id, safe=""), target_id)
+        return {"printer": printer, "url": PRINTER_DEVICES_URL}
+    target_id = args.printer_id
+    if not target_id:
+        raise HubError("请指定要查看或修改的打印机。", code="printer_required")
+    path = "/api/printers/" + quote(target_id, safe="")
+    changes = {field: value.strip() for field in ("name", "location")
+               if (value := getattr(args, field)) is not None}
+    if args.clear_location:
+        changes["location"] = ""
+    expected = dict(changes)
+    if args.probe_id:
+        probe = printer_probe(args.probe_id, "shared")
+        if probe.get("printer_id") != target_id or not probe.get("can_save"):
+            raise HubError(probe.get("error") or "请对此设备完成连接检测后再保存。", code="probe_not_ready")
+        endpoint = probe["endpoint"]
+        changes.update(ipp_port=endpoint["ipp_port"], ipp_path=endpoint["ipp_path"], probe_id=args.probe_id)
+        expected.update(endpoint)
+    if not changes:
+        raise HubError("请指定要修改的名称、位置或已检测的连接配置。", code="missing_changes")
+    body = json.dumps({**changes, "version": args.version}).encode("utf-8")
+    try:
+        saved = api(path, method="PATCH", body=body, content_type="application/json")
+        printer = saved.get("printer") if isinstance(saved, dict) else None
+        if not isinstance(printer, dict) or printer.get("id") != target_id:
+            raise HubError("后台未返回已更新的设备配置。", code="invalid_response", uncertain=True)
+    except HubError as exc:
+        if not exc.uncertain:
+            raise
+        try:
+            printer = shared_printer_config(path, target_id)
+            if all(printer.get(field) == value for field, value in expected.items()):
+                return {"printer": printer, "url": PRINTER_DEVICES_URL, "verified_after_read": True}
+        except HubError:
+            pass
+        raise HubError("设备修改结果待核实，请先重新读取配置。", code="edit_unconfirmed", uncertain=True) from exc
+    return {"printer": printer, "url": PRINTER_DEVICES_URL}
+
+
 def number(minimum, maximum=None):
     def validate(value):
         try:
@@ -494,6 +658,37 @@ def parser():
     browser.add_argument("--browser", action="store_true", help="请求系统默认浏览器打开页面")
     browser.add_argument("--add-printer", action="store_true", help="打开设备页以添加打印机")
     commands.add_parser("printers", help="列出设备")
+    for name, help_text in (
+        ("shared-printer", "查看、添加或修改公司共享打印机"),
+        ("personal-printer", "检测并添加本机个人打印机"),
+    ):
+        devices = commands.add_parser(name, help=help_text)
+        device_actions = devices.add_subparsers(dest="printer_action", required=True)
+        detect = device_actions.add_parser("detect", help="读取设备能力")
+        detect.add_argument("--ip", required=True)
+        detect.add_argument("--ipp-port", type=number(1, 65535), default=631)
+        detect.add_argument("--ipp-path", default="/ipp/print")
+        device_actions.add_parser("check").add_argument("--probe-id", required=True)
+        save_device = device_actions.add_parser("save")
+        save_device.add_argument("--probe-id", required=True)
+        save_device.add_argument("--name")
+        save_device.add_argument("--location", default="")
+        if name == "shared-printer":
+            show = device_actions.add_parser("show", help="读取共享设备配置")
+            show.add_argument("--printer", required=True, help="设备 ID、名称或位置")
+            edit_detect = device_actions.add_parser("edit-detect", allow_abbrev=False,
+                                                    help="以设备已登记的 IP 检测新端口或路径")
+            edit_detect.add_argument("--printer-id", required=True)
+            edit_detect.add_argument("--ipp-port", type=number(1, 65535))
+            edit_detect.add_argument("--ipp-path")
+            edit = device_actions.add_parser("edit", allow_abbrev=False, help="保存已确认的共享设备修改")
+            edit.add_argument("--printer-id", required=True)
+            edit.add_argument("--version", required=True, help="show 返回的配置版本")
+            edit.add_argument("--name")
+            location = edit.add_mutually_exclusive_group()
+            location.add_argument("--location")
+            location.add_argument("--clear-location", action="store_true", help="清空已登记的位置")
+            edit.add_argument("--probe-id", help="修改端口或路径时使用 edit-detect 返回的标识")
     commands.add_parser("converter", help="查看文档转换服务")
     preferences = commands.add_parser("preferences", help="查看或修改本机打印设置")
     actions = preferences.add_subparsers(dest="preferences_action", required=True)
@@ -565,6 +760,10 @@ def run(args):
         if "setup" in result:
             result["reply"] = f"[打开打印后台]({url})\n\n{result['setup']['prompt']}"
         return result
+    if name in ("shared-printer", "personal-printer"):
+        if name == "shared-printer" and args.printer_action in ("show", "edit-detect", "edit"):
+            return edit_shared_printer(args)
+        return register_printer(args, scope="shared" if name == "shared-printer" else "personal")
     if name in ("print-file", "print-text"):
         return submit(args)
     if name == "task":

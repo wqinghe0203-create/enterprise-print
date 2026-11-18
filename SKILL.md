@@ -1,13 +1,24 @@
 ---
 name: enterprise-print
-description: 通过企业 Print Hub 在 WorkBuddy 中直接打印聊天正文、已生成的内容或附件，并打开内网打印后台、查询打印机和任务、查打印记录、取消任务或调整优先级。适用于公司 10.0.249.200 文印服务。
+description: 在 WorkBuddy 打印正文、附件和生成的文件，添加或修改共享打印机，查询队列与打印记录。
 metadata:
-  version: "1.0.11"
+  version: "0.0.1"
 ---
 
 # 企业文印 Print Hub
 
-**每次调用本技能，先运行 `scripts/print_hub.py preferences check`。** 即使用户只是问技能用途、使用方法或查询状态，也要在回答或处理原请求前执行检查。用户正在回答设置卡时，接着处理已有答案。
+## 常用指令
+
+- 打印这份附件
+- 添加打印机
+- 修改 28 楼工作区打印机的位置
+- 查今天的打印记录
+
+[导入与连接设置](导入与配置.md)
+
+## 对话执行
+
+收到添加或修改打印机的请求时，直接进入对应的设备流程。用户正在回答设置卡或设备确认时，继续处理已有答案。其余调用先运行 `scripts/print_hub.py preferences check`。
 
 **收到 `setup.ask_user_question` 就立即把整个对象原样交给 WorkBuddy 原生工具 `AskUserQuestion`，一次弹出整张卡。直接弹卡，省去「是否现在配置」的确认。** 工具不可用或报错时，直接一次展示 `setup.prompt` 中的选项。检查无 `setup` 时正常处理原请求。若有 `setup_error`，说明无法加载设置；仍可处理原问题或查询。
 
@@ -21,13 +32,30 @@ CLI 已内置该后台当前证书的已确认指纹。只有 CLI 报证书指�
 
 首次配置使用四题卡。已有完整配置时，用户主动说「修改默认打印设置」就运行 `preferences setup` 并直接弹四题卡。旧设置只有前三项时，`preferences check` 会返回一张只问提交人的卡，并带有 `setup.existing_preferences`。对话省略 CLI 的 JSON 和错误代码。
 
-1. **默认打印机。** 用 `setup.printers` 将选项字母映射到设备 ID。收到「提交后打开后台添加打印机」的答案后，执行 `open --add-printer --browser` 并提供设备页链接。设备添加后，执行 `preferences setup` 刷新列表，再请用户选新设备。选「更多打印机」时，从 `setup.device_options` 每页展示至多 3 台和一个分页选项。需要重新选设备时，保留同一张卡中已经提交的其他答案，只补问缺失项。
+1. **默认打印机。** 用 `setup.printers` 将选项字母映射到设备 ID。选择「在对话中添加共享打印机」后，进入共享添加流程。设备添加后，执行 `preferences setup` 刷新列表，再请用户选新设备。选「更多打印机」时，从 `setup.device_options` 每页展示至多 3 台和一个分页选项。需要重新选设备时，保留同一张卡中已经提交的其他答案，只补问缺失项。
 2. **单双面和任务优先级。** 「单面」「双面 · 长边翻页」「双面 · 短边翻页」依次映射为 `simplex`、`duplex_long`、`duplex_short`。优先级选项依次映射为 50、80、100。收到「其他补充」时，仅接受能明确对应到这些预设的答案。其余情况请用户重选该题。
 3. **提交人。** 选当前系统用户名时使用 `--system-user`。自定义时在本题的「其他补充」填写姓名或工号，随整张卡提交。收到自定义文字时，用文件工具把它原样写到一行 UTF-8 临时文件，再用 `--user-file <文件路径>` 保存。删除为此创建的临时文件。选「稍后配置」时，暂不保存或打印。
 4. 答案齐全后，执行一次 `preferences set --printer <设备ID> --duplex <模式> --priority <数值>`，并附上所选提交人的参数。补齐旧设置时改用 `preferences set-user` 和提交人参数，保留原有三项。用户取消时暂不保存或打印。若缺少答案、设备已移除或提交人无效，保留其他有效答案，只补问需要修正的项目。
 5. 保存成功后，脚本会打开打印设备页同步设置。若返回 `preferences_sync_error`，告知用户如何补做同步。如果已有明确的待打印请求，使用原文件或正文、本次明确指定的参数和同一个提交标识继续提交。份数默认 1，本次参数优先于个人设置。
 
 从对话打开后台时使用 `open --browser`，由脚本将已保存的四项设置交给当前浏览器。「打开打印设备页」使用 `open --page devices --browser`。对话只展示脚本返回的普通链接 `url`。
+
+## 添加打印机
+
+「添加打印机」和设置卡里的「在对话中添加共享打印机」使用 `shared-printer`，保存到中心平台。明确说「添加个人打印机」或「只添加到本机」时使用 `personal-printer`，保存到本机。检测、查询和保存使用同一个命令前缀。
+
+- 添加时从当前对话提取已给出的字段。缺少 IP 时一次提示：「请发打印机的公司内网 IPv4。可以一起告诉我显示名称和位置，例如：192.168.10.25，研发区打印机，3 楼东侧。默认使用 IPP 端口 631、路径 /ipp/print，特殊配置也可以一并发来。」保留已提供的值，只补问缺失或无效项。
+- 执行 `<命令前缀> detect --ip <IPv4>`，有非默认值时附上 `--ipp-port` 和 `--ipp-path`。若 `probe.status=pending`，用相同的 `probe_id` 执行 `<命令前缀> check --probe-id <标识>`。按返回的具体原因说明连接失败、不兼容或重复。检测只查询能力。
+- `probe.can_save=true` 时，用名称、型号、位置和完整 `ipp://IP:端口/路径` 确认目标，并说明将保存到中心平台或本机。名称缺省用设备上报值，位置可留空。用 WorkBuddy 原生 `AskUserQuestion` 提供「确认添加」「修改信息」「取消」，不可用时接受文字答复。取消或关闭确认卡时结束本次添加。修改 IP、端口或路径后重新检测。
+- 用户确认后执行 `<命令前缀> save --probe-id <标识> [--name <名称>] [--location <位置>]`。明确返回检测过期时，重新检测并再次确认。共享保存成功后用返回的 `printer.name`、`printer.id` 和 `url` 回复，附上中心设备页链接。从设置卡发起时，刷新候选并保留此前的设置答案。
+- 共享保存返回结果待核实时，先请用户查看中心设备列表，避免重新检测并提交。个人保存响应不确定时，在本机 Print Hub 的设备页核实。
+
+## 修改共享打印机
+
+- 用户说「修改打印机配置」时，执行 `shared-printer show --printer <设备ID、名称或位置>`。匹配多台时展示候选名称和位置，请用户选定设备，再用其 ID 读取配置。保留返回的 `printer.id` 和 `printer.version`。
+- 展示现有名称、位置和 IPP 连接，IP 仅供核对。用户要修改 IP 时，说明已登记的 IP 固定。名称和位置可直接确认，位置允许清空。要修改端口或路径，用 `shared-printer edit-detect --printer-id <ID> [--ipp-port <端口>] [--ipp-path <路径>]` 检测。检测仍在运行时用 `shared-printer check --probe-id <标识>` 查询，等到可保存再确认。
+- 用 WorkBuddy 原生 `AskUserQuestion` 展示设备名称、位置及要修改的字段，提供「确认修改」「取消」，不可用时接受文字回复。用户确认后执行 `shared-printer edit --printer-id <ID> --version <版本> [--name <名称>] [--location <位置> 或 --clear-location] [--probe-id <标识>]`，只传需要修改的字段。取消或关闭确认卡时结束本次编辑。
+- 保存成功后展示更新后的名称、位置和中心设备页链接。配置版本已变化时先重新读取并确认。检测过期时重新检测并确认。有待处理任务时按后台提示处理队列。若返回结果待核实，先重新读取配置。
 
 ## 打印聊天正文或附件
 
@@ -50,7 +78,8 @@ py -3 .\scripts\print_hub.py print-file --file "C:\实际路径\附件.docx" --p
 | --- | --- |
 | 打开打印记录 | `open --browser` |
 | 打开工作台、设备、队列或新建打印 | `open --page overview --browser`，页面参数也可用 `devices`、`queue`、`new-print` |
-| 添加打印机 | `open --add-printer --browser`，在设备页填写 IP、检测并保存 |
+| 添加打印机 | 在对话中走共享设备添加流程 |
+| 添加个人打印机 | 在对话中走本机设备添加流程，需要本机 Print Hub 已运行 |
 | 列出打印机或查询转换服务 | `printers` 或 `converter` |
 | 查看设备状态、实时作业或网络诊断 | `status --printer "28楼"`、`queue --printer "28楼"` 或 `diag --printer "28楼"` |
 | 查询打印记录 | `history --printer "28楼" --search "会议通知" --user "张三" --start YYYY-MM-DD --end YYYY-MM-DD`，按需要添加筛选 |
